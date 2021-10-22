@@ -144,6 +144,25 @@ function poll_while(f::Function; timeout_seconds::Integer = 120)
     return true
 end
 
+function getenv_run_distributed_multithreaded()
+    default_value = "false"
+    environment_variable_name = "JULIA_TEST_RUN_DISTRIBUTED_MULTITHREADED"
+    environment_variable_value = strip(get(ENV, environment_variable_name, default_value))
+    b = parse(Bool, environment_variable_value)::Bool
+    return b
+end
+const env_run_distributed_multithreaded = getenv_run_distributed_multithreaded()
+function run_distributed_multithreaded()
+    if Threads.nthreads() > 1
+        if env_run_distributed_multithreaded
+            return true
+        end
+        @warn "Skipping a Distributed test because `Threads.nthreads() > 1`" Threads.nthreads()
+        return false
+    end
+    return true
+end
+
 # Distributed GC tests for Futures
 function test_futures_dgc(id)
     f = remotecall(myid, id)
@@ -267,7 +286,9 @@ let wid1 = workers()[1],
     fstore = RemoteChannel(wid2)
 
     put!(fstore, rr)
-    @test remotecall_fetch(k -> haskey(Distributed.PGRP.refs, k), wid1, rrid) == true
+    if run_distributed_multithreaded()
+        @test remotecall_fetch(k -> haskey(Distributed.PGRP.refs, k), wid1, rrid) == true
+    end
     finalize(rr) # finalize locally
     yield() # flush gc msgs
     @test remotecall_fetch(k -> haskey(Distributed.PGRP.refs, k), wid1, rrid) == true
