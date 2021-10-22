@@ -145,8 +145,8 @@ function poll_while(f::Function; timeout_seconds::Integer = 120)
 end
 
 function getenv_run_distributed_multithreaded()
-    default_value = "false"
-    environment_variable_name = "JULIA_TEST_RUN_DISTRIBUTED_MULTITHREADED"
+    default_value = "true"
+    environment_variable_name = "JULIA_TEST_SKIP_IF_MULTITHREADED"
     environment_variable_value = strip(get(ENV, environment_variable_name, default_value))
     b = parse(Bool, environment_variable_value)::Bool
     return b
