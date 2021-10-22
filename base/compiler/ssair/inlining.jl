@@ -35,7 +35,6 @@ end
 struct DelayedInliningSpec
     match::Union{MethodMatch, InferenceResult}
     atypes::Vector{Any}
-    stmttype::Any
 end
 
 struct InliningTodo
@@ -44,11 +43,11 @@ struct InliningTodo
     spec::Union{ResolvedInliningSpec, DelayedInliningSpec}
 end
 
-InliningTodo(mi::MethodInstance, match::MethodMatch,
-    atypes::Vector{Any}, @nospecialize(stmttype)) = InliningTodo(mi, DelayedInliningSpec(match, atypes, stmttype))
+InliningTodo(mi::MethodInstance, match::MethodMatch, atypes::Vector{Any}) =
+    InliningTodo(mi, DelayedInliningSpec(match, atypes))
 
-InliningTodo(result::InferenceResult, atypes::Vector{Any}, @nospecialize(stmttype)) =
-    InliningTodo(result.linfo, DelayedInliningSpec(result, atypes, stmttype))
+InliningTodo(result::InferenceResult, atypes::Vector{Any}) =
+    InliningTodo(result.linfo, DelayedInliningSpec(result, atypes))
 
 struct ConstantCase
     val::Any
@@ -677,7 +676,7 @@ function rewrite_apply_exprargs!(ir::IRCode, todo::Vector{Pair{Int, Any}}, idx::
                 handled = false
                 if isa(info, ConstCallInfo)
                     if !is_stmt_noinline(flag) && maybe_handle_const_call!(
-                        ir, state1.id, new_stmt, info, new_sig,call.rt, istate, flag, false, todo)
+                        ir, state1.id, new_stmt, info, new_sig, istate, flag, false, todo)
                         handled = true
                     else
                         info = info.call
@@ -687,8 +686,9 @@ function rewrite_apply_exprargs!(ir::IRCode, todo::Vector{Pair{Int, Any}}, idx::
                     info = isa(info, MethodMatchInfo) ?
                         MethodMatchInfo[info] : info.matches
                     # See if we can inline this call to `iterate`
-                    analyze_single_call!(ir, todo, state1.id, new_stmt,
-                        new_sig, call.rt, info, istate, flag)
+                    analyze_single_call!(
+                        ir, todo, state1.id, new_stmt,
+                        new_sig, info, istate, flag)
                 end
                 if i != length(thisarginfo.each)
                     valT = getfield_tfunc(call.rt, Const(1))
@@ -708,11 +708,13 @@ function rewrite_apply_exprargs!(ir::IRCode, todo::Vector{Pair{Int, Any}}, idx::
     return new_argexprs, new_atypes
 end
 
-function rewrite_invoke_exprargs!(argexprs::Vector{Any})
+function rewrite_invoke_exprargs!(expr::Expr)
+    argexprs = expr.args
     argexpr0 = argexprs[2]
     argexprs = argexprs[4:end]
     pushfirst!(argexprs, argexpr0)
-    return argexprs
+    expr.args = argexprs
+    return expr
 end
 
 function compileable_specialization(et::Union{EdgeTracker, Nothing}, match::MethodMatch)
@@ -791,7 +793,7 @@ function validate_sparams(sparams::SimpleVector)
 end
 
 function analyze_method!(match::MethodMatch, atypes::Vector{Any},
-                         state::InliningState, @nospecialize(stmttyp), flag::UInt8)
+                         state::InliningState, flag::UInt8)
     method = match.method
     methsig = method.sig
 
@@ -821,7 +823,7 @@ function analyze_method!(match::MethodMatch, atypes::Vector{Any},
         return compileable_specialization(et, match)
     end
 
-    todo = InliningTodo(mi, match, atypes, stmttyp)
+    todo = InliningTodo(mi, match, atypes)
     # If we don't have caches here, delay resolving this MethodInstance
     # until the batch inlining step (or an external post-processing pass)
     state.mi_cache === nothing && return todo
@@ -846,17 +848,13 @@ function handle_single_case!(ir::IRCode, stmt::Expr, idx::Int, @nospecialize(cas
     if isa(case, ConstantCase)
         ir[SSAValue(idx)] = case.val
     elseif isa(case, MethodInstance)
-        if isinvoke
-            stmt.args = rewrite_invoke_exprargs!(stmt.args)
-        end
+        isinvoke && rewrite_invoke_exprargs!(stmt)
         stmt.head = :invoke
         pushfirst!(stmt.args, case)
     elseif case === nothing
         # Do, well, nothing
     else
-        if isinvoke
-            stmt.args = rewrite_invoke_exprargs!(stmt.args)
-        end
+        isinvoke && rewrite_invoke_exprargs!(stmt)
         push!(todo, idx=>(case::InliningTodo))
     end
     nothing
@@ -1005,7 +1003,6 @@ is_builtin(s::Signature) =
 function inline_invoke!(ir::IRCode, idx::Int, sig::Signature, (; match, result)::InvokeCallInfo,
         state::InliningState, todo::Vector{Pair{Int, Any}}, flag::UInt8)
     stmt = ir.stmts[idx][:inst]
-    calltype = ir.stmts[idx][:type]
 
     if !match.fully_covers
         # TODO: We could union split out the signature check and continue on
@@ -1018,7 +1015,7 @@ function inline_invoke!(ir::IRCode, idx::Int, sig::Signature, (; match, result):
     pushfirst!(atypes, atype0)
 
     if isa(result, InferenceResult) && !is_stmt_noinline(flag)
-        (; mi) = item = InliningTodo(result, atypes, calltype)
+        (; mi) = item = InliningTodo(result, atypes)
         validate_sparams(mi.sparam_vals) || return nothing
         if argtypes_to_type(atypes) <: mi.def.sig
             state.mi_cache !== nothing && (item = resolve_todo(item, state, flag))
@@ -1027,7 +1024,7 @@ function inline_invoke!(ir::IRCode, idx::Int, sig::Signature, (; match, result):
         end
     end
 
-    result = analyze_method!(match, atypes, state, calltype, flag)
+    result = analyze_method!(match, atypes, state, flag)
     handle_single_case!(ir, stmt, idx, result, true, todo)
     return nothing
 end
@@ -1136,13 +1133,12 @@ function process_simple!(ir::IRCode, todo::Vector{Pair{Int, Any}}, idx::Int, sta
     return sig
 end
 
-function analyze_single_call!(ir::IRCode, todo::Vector{Pair{Int, Any}}, idx::Int, @nospecialize(stmt),
-        sig::Signature, @nospecialize(calltype), infos::Vector{MethodMatchInfo},
-        state::InliningState, flag::UInt8)
+function analyze_single_call!(
+    ir::IRCode, todo::Vector{Pair{Int, Any}}, idx::Int, @nospecialize(stmt),
+    sig::Signature, infos::Vector{MethodMatchInfo}, state::InliningState, flag::UInt8)
     cases = Pair{Any, Any}[]
-    signature_union = Union{}
-    only_method = nothing  # keep track of whether there is one matching method
-    too_many = false
+    local signature_union = Bottom
+    local only_method = nothing  # keep track of whether there is one matching method
     local meth
     local fully_covered = true
     for i in 1:length(infos)
@@ -1151,8 +1147,7 @@ function analyze_single_call!(ir::IRCode, todo::Vector{Pair{Int, Any}}, idx::Int
         if meth.ambig
             # Too many applicable methods
             # Or there is a (partial?) ambiguity
-            too_many = true
-            break
+            return
         elseif length(meth) == 0
             # No applicable methods; try next union split
             continue
@@ -1172,7 +1167,7 @@ function analyze_single_call!(ir::IRCode, todo::Vector{Pair{Int, Any}}, idx::Int
                 fully_covered = false
                 continue
             end
-            case = analyze_method!(match, sig.atypes, state, calltype, flag)
+            case = analyze_method!(match, sig.atypes, state, flag)
             if case === nothing
                 fully_covered = false
                 continue
@@ -1182,8 +1177,6 @@ function analyze_single_call!(ir::IRCode, todo::Vector{Pair{Int, Any}}, idx::Int
             push!(cases, Pair{Any,Any}(spec_types, case))
         end
     end
-
-    too_many && return
 
     signature_fully_covered = sig.atype <: signature_union
     # If we're fully covered and there's only one applicable method,
@@ -1199,7 +1192,7 @@ function analyze_single_call!(ir::IRCode, todo::Vector{Pair{Int, Any}}, idx::Int
             match = meth[1]
         end
         fully_covered = true
-        case = analyze_method!(match, sig.atypes, state, calltype, flag)
+        case = analyze_method!(match, sig.atypes, state, flag)
         case === nothing && return
         push!(cases, Pair{Any,Any}(match.spec_types, case))
     end
@@ -1219,34 +1212,41 @@ function analyze_single_call!(ir::IRCode, todo::Vector{Pair{Int, Any}}, idx::Int
     return nothing
 end
 
+# try to create `InliningTodo`s using constant-prop'ed results
+# currently it works only when constant-prop' succeeded for all (union-split) signatures
+# TODO use any of constant-prop'ed results, and leave the other unhandled cases to later
 function maybe_handle_const_call!(ir::IRCode, idx::Int, stmt::Expr,
-        info::ConstCallInfo, sig::Signature, @nospecialize(calltype),
+        info::ConstCallInfo, sig::Signature,
         state::InliningState, flag::UInt8,
         isinvoke::Bool, todo::Vector{Pair{Int, Any}})
-    # when multiple matches are found, bail out and later inliner will union-split this signature
-    # TODO effectively use multiple constant analysis results here
-    length(info.results) == 1 || return false
-    result = info.results[1]
-    isa(result, InferenceResult) || return false
-
-    (; mi) = item = InliningTodo(result, sig.atypes, calltype)
-    validate_sparams(mi.sparam_vals) || return true
-    mthd_sig = mi.def.sig
-    mistypes = mi.specTypes
-    state.mi_cache !== nothing && (item = resolve_todo(item, state, flag))
-    if sig.atype <: mthd_sig
-        handle_single_case!(ir, stmt, idx, item, isinvoke, todo)
-        return true
-    else
-        item === nothing && return true
-        # Union split out the error case
-        item = UnionSplit(false, sig.atype, Pair{Any, Any}[mistypes => item])
-        if isinvoke
-            stmt.args = rewrite_invoke_exprargs!(stmt.args)
+    sigtype = sig.atype
+    cases = Pair{Any, Any}[] # TODO avoid this allocation for single cases ?
+    local fully_covered = true
+    local signature_union = Bottom
+    for result in info.results
+        isa(result, InferenceResult) || return false
+        (; mi) = item = InliningTodo(result, sig.atypes)
+        if !validate_sparams(mi.sparam_vals)
+            fully_covered = false
+            continue
         end
-        push!(todo, idx=>item)
-        return true
+        state.mi_cache !== nothing && (item = resolve_todo(item, state, flag))
+        if item === nothing
+            fully_covered = false
+            continue
+        end
+        push!(cases, Pair{Any,Any}(mi.specTypes, item))
+        signature_union = Union{signature_union, mi.def.sig}
     end
+    fully_covered &= sigtype <: signature_union
+    if fully_covered && length(cases) == 1
+        handle_single_case!(ir, stmt, idx, cases[1][2], isinvoke, todo)
+    elseif length(cases) > 0
+        item = UnionSplit(fully_covered, sigtype, cases)
+        isinvoke && rewrite_invoke_exprargs!(stmt)
+        push!(todo, idx=>item)
+    end
+    return true
 end
 
 function assemble_inline_todo!(ir::IRCode, state::InliningState)
@@ -1258,11 +1258,11 @@ function assemble_inline_todo!(ir::IRCode, state::InliningState)
         sig === nothing && continue
 
         stmt = ir.stmts[idx][:inst]
-        calltype = ir.stmts[idx][:type]
         info = ir.stmts[idx][:info]
 
         # Check whether this call was @pure and evaluates to a constant
         if info isa MethodResultPure
+            calltype = ir.stmts[idx][:type]
             if calltype isa Const && is_inlineable_constant(calltype.val)
                 ir.stmts[idx][:inst] = quoted(calltype.val)
                 continue
@@ -1278,12 +1278,11 @@ function assemble_inline_todo!(ir::IRCode, state::InliningState)
             continue
         end
 
-        # If inference arrived at this result by using constant propagation,
-        # it'll have performed a specialized analysis for just this case. Use its
-        # result.
+        # if inference arrived here with constant-prop'ed result(s),
+        # we can perform a specialized analysis for just this case
         if isa(info, ConstCallInfo)
             if !is_stmt_noinline(flag) && maybe_handle_const_call!(
-                ir, idx, stmt, info, sig, calltype, state, flag, sig.f === Core.invoke, todo)
+                ir, idx, stmt, info, sig, state, flag, sig.f === Core.invoke, todo)
                 continue
             else
                 info = info.call
@@ -1291,7 +1290,7 @@ function assemble_inline_todo!(ir::IRCode, state::InliningState)
         end
 
         if isa(info, OpaqueClosureCallInfo)
-            result = analyze_method!(info.match, sig.atypes, state, calltype, flag)
+            result = analyze_method!(info.match, sig.atypes, state, flag)
             handle_single_case!(ir, stmt, idx, result, false, todo)
             continue
         end
@@ -1313,7 +1312,7 @@ function assemble_inline_todo!(ir::IRCode, state::InliningState)
             continue
         end
 
-        analyze_single_call!(ir, todo, idx, stmt, sig, calltype, infos, state, flag)
+        analyze_single_call!(ir, todo, idx, stmt, sig, infos, state, flag)
     end
     todo
 end

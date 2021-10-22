@@ -680,3 +680,30 @@ let f(x) = (x...,)
     # the the original apply call is not union-split, but the inserted `iterate` call is.
     @test code_typed(f, Tuple{Union{Int64, CartesianIndex{1}, CartesianIndex{3}}})[1][2] == Tuple{Int64}
 end
+
+let # https://github.com/JuliaLang/julia/issues/42754
+    # inline union-split constant-prop'ed sources
+    code = @eval Module() begin
+        mutable struct X
+            # NOTE in order to confuse `fieldtype_tfunc`, we need to have at least two fields with different types
+            a::Union{Nothing, Int}
+            b::Symbol
+        end
+        $code_typed1((X, Union{Nothing,Int})) do x, a
+            # this `setproperty` call would be union-split and constant-prop will happen for
+            # each signature: inlining would fail if we don't use constant-prop'ed source
+            # since the approximate inlining cost of `convert(fieldtype(X, sym), a)` would
+            # end up very high if we don't propagate `sym::Const(:a)`
+            x.a = a
+            x
+        end
+    end
+    @test all(code) do @nospecialize(x)
+        isinvoke(x, :setproperty!) && return false
+        if Meta.isexpr(x, :call)
+            f = x.args[1]
+            isa(f, GlobalRef) && f.name === :setproperty! && return false
+        end
+        return true
+    end
+end
