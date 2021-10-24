@@ -158,6 +158,7 @@ function run_distributed_multithreaded()
             return true
         end
         @warn "Skipping a Distributed test because `Threads.nthreads() > 1`" Threads.nthreads()
+        Test.@test_broken false
         return false
     end
     return true
